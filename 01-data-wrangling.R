@@ -100,7 +100,7 @@ ltb <- ltb %>%
   filter(time > -48)
 
 ## Lets weave in the cambridge data here
-## Are there ANY Cambridhe patients with PaO2 data? We don't want to overwrite
+## Are there ANY Cambridge patients with PaO2 data? We don't want to overwrite
 
 ltb %>%
   filter(episode_id %in% unique(ltb_imp$episode_id)) %>%
@@ -135,7 +135,7 @@ ltb <- bind_rows(cam, others) %>%
 # Expand this dense tb (add NAs where appropraite)
 ltb <- ltb %>%
   select(episode_id, time) %>%
-  split(., .$episode_id) %>% 
+  split(., .$episode_id) %>%
   imap(function(base_table, epi_id) {
     tibble(episode_id = as.integer(epi_id),
            time = seq(min(base_table$time, 0L),
@@ -339,7 +339,7 @@ ltb <- inner_join(ltb, valid_spells_f, by = "episode_id")
 # negative information for episode position > 1 must be dropped
 # This drop a very small number of rows, as expected.
 
-ltb <- ltb %>% 
+ltb <- ltb %>%
   filter(episode_position == 1 | time >= 0)
 
 # Remove information from an episode than extends beyond its length of stay
@@ -372,13 +372,29 @@ custom_impute <- function(x) {
   }
 }
 
-## Linear imputation proceedure
+## Flag PaO2s that come from a sample with an SpO2 of 100
 
+ltb <- ltb %>%
+  mutate(high_o2 = if_else(!is.na(pao2) & spo2 == 100, TRUE, FALSE),
+         pao2_original = if_else(!is.na(pao2), TRUE, FALSE))
+
+## Linear imputation proceedure
 ltb <- ltb %>%
   group_by(spell_id) %>%
   arrange(spell_id, episode_position, time) %>%
   mutate_at(.vars = vars(spo2, pao2, fio2, tidal_vol, peep, mean_ap, rr_spont, peak_ap, pf_ratio),
             .funs = custom_impute)
+
+## LOCF imputation proceedure (for categorical variables)
+ltb <- ltb %>%
+  group_by(spell_id) %>%
+  arrange(spell_id, episode_position, time) %>%
+  mutate(ventilation = as.character(ventilation)) %>%
+  mutate_at(.vars = vars(ventilation, airway),
+            .funs = locfStr, steps = 24)
+
+ltb <- ltb %>%
+  mutate(ventilated = (!is.na(ventilation) | airway %in% c("E", "T") | !is.na(tidal_vol)))
 
 save.image(file = "####/post_imputation.RData")
 
@@ -440,6 +456,20 @@ ltb <- ltb %>%
 
 save.image(file = "####/check_point1.RData")
 
+## pull out details of how much missingness is present for PaO2
+
+imp_table <- ltb %>%
+  filter(spell_id %in% valid_spells_f$spell_id) %>%
+  filter(!(spell_id %in% no_data)) %>%
+  ungroup() %>%
+  summarise(raw_pao2 = sum(pao2_original),
+            imp_pao2 = sum((pao2_original == FALSE & !is.na(pao2))),
+            imp_pao2_high = sum((pao2_original == FALSE & pao2 >= 13.3 & spo2 == 100), na.rm = TRUE),
+            count = n(),
+            proportion_imp = imp_pao2/count,
+            proportion_high_imp = imp_pao2_high/count) %>%
+  gather()
+
 ## Conventional Hyperoxia ----
 ## AUC by trapezoid rule
 
@@ -477,7 +507,7 @@ testthat::expect_false(any(is.na(ltb$hyperoxic_13_dose)))
 ## Everything has a value, so we are safe to use cumulative sum
 
 # Now lets just create cumulative oxygen doses
-ltb <- ltb %>% 
+ltb <- ltb %>%
   group_by(spell_id) %>%
   arrange(spell_id, time) %>%
   mutate(cumulative_hyperoxia_13 = cumsum(hyperoxic_13_dose))
@@ -512,7 +542,7 @@ dtb <- left_join(valid_spells_f, dtb, by = "episode_id")
 ## Compress Spells ===
 
 ## Spells are comprised of more than 1 episode. So we want information from the final
-## episode (death) and from the first (apache) where relevent
+## episode (death) and from the first (apache) where relevant
 
 ## Take the LATEST info for death
 backwards <- dtb %>%
@@ -545,6 +575,7 @@ dtb %>%
 
 table(dtb$withdrawal, useNA = "always")
 table(dtb$organ_donor, useNA = "always")
+table(dtb$cpr, useNA = "always")
 
 table(dtb$withdrawal, dtb$organ_donor, useNA = "always")
 
@@ -768,29 +799,44 @@ dtb <- dtb %>%
 ## So for a tw mean, we need to divide by the number of hours
 ## We will refer to this as "hyperoxia dose"
 
+ltb <- ltb %>%
+  mutate(row_id = 1:n()) %>%
+  mutate(const_vent = cumsum(ventilated)) %>%
+  mutate(intermediate = if_else(is.na(pao2_auc), 0, pao2_auc)) %>%
+  mutate(cum_oxy_total = cumsum(intermediate)) %>%
+  select(-intermediate)
+
 cohort_1 <- ltb %>%
   filter(time == 1*24) %>%
-  select(spell_id, time, cumulative_hyperoxia_13) %>%
+  mutate(cv = if_else(const_vent == row_id, TRUE, FALSE)) %>%
+  select(spell_id, time, cumulative_hyperoxia_13, cv, cum_oxy_total) %>%
   mutate(tw_hyperoxia_13 = cumulative_hyperoxia_13/time) %>%
-  select(spell_id, cumulative_hyperoxia_13, tw_hyperoxia_13)
+  mutate(oxy_total = cum_oxy_total/time) %>%
+  select(spell_id, cumulative_hyperoxia_13, tw_hyperoxia_13, cv, oxy_total)
 
 cohort_2 <- ltb %>%
   filter(time == 3*24) %>%
-  select(spell_id, time, cumulative_hyperoxia_13) %>%
+  mutate(cv = if_else(const_vent == row_id, TRUE, FALSE)) %>%
+  select(spell_id, time, cumulative_hyperoxia_13, cv, cum_oxy_total) %>%
   mutate(tw_hyperoxia_13 = cumulative_hyperoxia_13/time) %>%
-  select(spell_id, cumulative_hyperoxia_13, tw_hyperoxia_13)
+  mutate(oxy_total = cum_oxy_total/time) %>%
+  select(spell_id, cumulative_hyperoxia_13, tw_hyperoxia_13, cv, oxy_total)
 
 cohort_3 <- ltb %>%
   filter(time == 5*24) %>%
-  select(spell_id, time, cumulative_hyperoxia_13) %>%
+  mutate(cv = if_else(const_vent == row_id, TRUE, FALSE)) %>%
+  select(spell_id, time, cumulative_hyperoxia_13, cv, cum_oxy_total) %>%
   mutate(tw_hyperoxia_13 = cumulative_hyperoxia_13/time) %>%
-  select(spell_id, cumulative_hyperoxia_13, tw_hyperoxia_13)
+  mutate(oxy_total = cum_oxy_total/time) %>%
+  select(spell_id, cumulative_hyperoxia_13, tw_hyperoxia_13, cv, oxy_total)
 
 cohort_4 <- ltb %>%
   filter(time == 7*24) %>%
-  select(spell_id, time, cumulative_hyperoxia_13) %>%
+  mutate(cv = if_else(const_vent == row_id, TRUE, FALSE)) %>%
+  select(spell_id, time, cumulative_hyperoxia_13, cv, cum_oxy_total) %>%
   mutate(tw_hyperoxia_13 = cumulative_hyperoxia_13/time) %>%
-  select(spell_id, cumulative_hyperoxia_13, tw_hyperoxia_13)
+  mutate(oxy_total = cum_oxy_total/time) %>%
+  select(spell_id, cumulative_hyperoxia_13, tw_hyperoxia_13, cv, oxy_total)
 
 cohort_1 <- inner_join(dtb, cohort_1, by = "spell_id")
 cohort_2 <- inner_join(dtb, cohort_2, by = "spell_id")
@@ -817,24 +863,103 @@ cohort_3 <- cohort_3 %>%
 cohort_4 <- cohort_4 %>%
   mutate(hyperoxia_13 = if_else(cumulative_hyperoxia_13 != 0, 1L, 0L))
 
-cohort_1 %>%
-  ggplot(aes(cumulative_hyperoxia_13)) + geom_histogram()
+## We will pick out exemplar cases at the lower, middle and upper quartiles
+## These are otherwise totally arbitrary (no cherry picking the best)
 
-cohort_1 %>%
-  arrange(desc(cumulative_hyperoxia_13)) %>%
-  select(spell_id, cumulative_hyperoxia_13, tw_hyperoxia_13)
+quantile(cohort_4$cumulative_hyperoxia_13)
 
-exemplar <- ltb %>%
-  filter(spell_id == "#####") %>%
+plot_exemplar_simple <- function(long_table, id) {
+
+exemplar <- long_table %>%
+  filter(spell_id == id,
+         time <= 168) %>%
   ungroup() %>%
-  select(time, fio2, spo2, pao2) %>%
+  select(time, fio2, spo2, pao2, pao2_original) %>%
   mutate(fio2 = fio2 * 100) %>%
-  gather(key = monitor, value = value, fio2:pao2)
+  mutate(ymax = if_else(pao2 <= 13.3, 13.3, pao2))
 
-exemplar %>%
-  ggplot(aes(x = time, y = value, group = monitor, colour = monitor)) +
-  geom_path() +
-  geom_hline(yintercept = 13.3, linetype = 2)
+max_o2 <- max(exemplar$pao2, na.rm = TRUE)
+
+plot_24 <- exemplar %>%
+  ggplot() +
+  geom_path(linetype = 2, size = 1.5, aes(x = time, y = pao2)) +
+  geom_ribbon(data = exemplar %>%
+                filter(time <= 24),
+              mapping = aes(x = time, ymin = 13.3, ymax = ymax), fill = "#377eb8") +
+  geom_point(data = exemplar %>%
+               filter(pao2_original == TRUE),
+             mapping = aes(x = time, y = pao2),
+             size = 3, colour = "#e41a1c") +
+  ylab(label = "PaO2 (kPa)") +
+  xlab(label = "") +
+  ylim(c(0, max_o2)) +
+  scale_x_continuous(breaks = c(0, 24, 48, 72, 96, 120, 144, 168)) +
+  theme(axis.title = element_text(size = rel(2)),
+        axis.text = element_text(size = rel(2)))
+
+plot_72 <- exemplar %>%
+  ggplot() +
+  geom_path(linetype = 2, size = 1.5, aes(x = time, y = pao2)) +
+  geom_ribbon(data = exemplar %>%
+                filter(time <= 72),
+              mapping = aes(x = time, ymin = 13.3, ymax = ymax), fill = "#377eb8") +
+  geom_point(data = exemplar %>%
+               filter(pao2_original == TRUE),
+             mapping = aes(x = time, y = pao2),
+             size = 3, colour = "#e41a1c") +
+  ylab(label = "PaO2 (kPa)") +
+  xlab(label = "") +
+  ylim(c(0, max_o2)) +
+  scale_x_continuous(breaks = c(0, 24, 48, 72, 96, 120, 144, 168)) +
+  theme(axis.title = element_text(size = rel(2)),
+        axis.text = element_text(size = rel(2)))
+
+plot_120 <- exemplar %>%
+  ggplot() +
+  geom_path(linetype = 2, size = 1.5, aes(x = time, y = pao2)) +
+  geom_ribbon(data = exemplar %>%
+                filter(time <= 120),
+              mapping = aes(x = time, ymin = 13.3, ymax = ymax), fill = "#377eb8") +
+  geom_point(data = exemplar %>%
+               filter(pao2_original == TRUE),
+             mapping = aes(x = time, y = pao2),
+             size = 3, colour = "#e41a1c") +
+  ylab(label = "PaO2 (kPa)") +
+  xlab(label = "") +
+  ylim(c(0, max_o2)) +
+  scale_x_continuous(breaks = c(0, 24, 48, 72, 96, 120, 144, 168)) +
+  theme(axis.title = element_text(size = rel(2)),
+        axis.text = element_text(size = rel(2)))
+
+plot_168 <- exemplar %>%
+  ggplot() +
+  geom_path(linetype = 2, size = 1.5, aes(x = time, y = pao2)) +
+  geom_ribbon(data = exemplar %>%
+                filter(time <= 168),
+              mapping = aes(x = time, ymin = 13.3, ymax = ymax), fill = "#377eb8") +
+  geom_point(data = exemplar %>%
+               filter(pao2_original == TRUE),
+             mapping = aes(x = time, y = pao2),
+             size = 3, colour = "#e41a1c") +
+  ylab(label = "PaO2 (kPa)") +
+  xlab(label = "time since admission (hours)") +
+  ylim(c(0, max_o2)) +
+  scale_x_continuous(breaks = c(0, 24, 48, 72, 96, 120, 144, 168)) +
+  theme(axis.title = element_text(size = rel(2)),
+        axis.text = element_text(size = rel(2)))
+
+grid_plot <- plot_grid(plot_24, plot_72, plot_120, plot_168, ncol = 1, align = "v")
+
+return(grid_plot)
+}
+
+lower_exemplar <- plot_exemplar_simple(ltb, xxxxx)
+middle_exemplar <- plot_exemplar_simple(ltb, xxxxx)
+high_exemplar <- plot_exemplar_simple(ltb, xxxxx)
+
+save_plot("./plots/exemplar_low.png", lower_exemplar, ncol = 1, nrow = 4, base_aspect_ratio = 2.8)
+save_plot("./plots/exemplar_med.png", middle_exemplar, ncol = 1, nrow = 4, base_aspect_ratio = 2.8)
+save_plot("./plots/exemplar_high.png", high_exemplar, ncol = 1, nrow = 4, base_aspect_ratio = 2.8)
 
 save.image("####/end_data_wrangling.RData")
 save(cohort_1, cohort_2, cohort_3, cohort_4, consort_info, file = "####/cohorts_final.RData")
